@@ -1,0 +1,363 @@
+from mySQLauthorisation import MySqlConnector
+import logging
+import sys
+import os
+import glob
+
+class ContentAdder:
+    def __init__(self):
+        self.db_connector = MySqlConnector()
+
+    def read_markdown_file(self, filepath: str) -> tuple[str, str]:
+        """Read content and theme from markdown file"""
+        try:
+            with open(filepath, 'r') as file:
+                content = file.read().strip()
+                # Use filename without extension as theme
+                theme = os.path.splitext(os.path.basename(filepath))[0]
+                return content, theme
+        except Exception as e:
+            logging.error(f"Failed to read markdown file {filepath}: {e}")
+            return None, None
+
+    def insert_content(self, content: str, theme: str = None) -> bool:
+        """Insert new content into database"""
+        conn = self.db_connector.getConnection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("SELECT MAX(post_number) FROM content")
+            max_post = cursor.fetchone()[0]
+            next_post = 1 if max_post is None else max_post + 1
+
+            query = """
+                INSERT INTO content 
+                (content, theme, status, post_number) 
+                VALUES (%s, %s, 'pending', %s)
+            """
+            cursor.execute(query, (content, theme, next_post))
+            conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Failed to insert content: {e}")
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+
+    def process_markdown_files(self, directory: str = 'content'):
+        """Process all markdown files in the specified directory"""
+        if not os.path.exists(directory):
+            print(f"Directory '{directory}' not found.")
+            return
+
+        markdown_files = glob.glob(os.path.join(directory, '*.md'))
+        
+        if not markdown_files:
+            print(f"No markdown files found in '{directory}'")
+            return
+
+        for filepath in markdown_files:
+            content, theme = self.read_markdown_file(filepath)
+            if content:
+                if self.insert_content(content, theme):
+                    print(f"Successfully added content from {filepath}")
+                else:
+                    print(f"Failed to add content from {filepath}")
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    # Get directory from command line argument or use default
+    directory = sys.argv[1] if len(sys.argv) > 1 else 'content'
+    
+    adder = ContentAdder()
+    adder.process_markdown_files(directory)
+from typing import Final
+
+# Application Mode
+TEST_MODE: Final[bool] = True
+
+# Posting Schedule
+POST_INTERVAL_MINUTES: Final[int] = 600  # 10 hours between posts
+MAX_DAILY_POSTS: Final[int] = 2
+
+# Error Handling
+RETRY_DELAY_SECONDS: Final[int] = 60
+
+# Test Mode Settings
+TEST_INTERVAL: Final[int] = 10  # Seconds between posts in test mode
+
+# Validation
+def validate_settings() -> bool:
+    """Validate that settings are within acceptable ranges."""
+    if POST_INTERVAL_MINUTES <= 0:
+        raise ValueError("POST_INTERVAL_MINUTES must be positive")
+    if MAX_DAILY_POSTS <= 0:
+        raise ValueError("MAX_DAILY_POSTS must be positive")
+    if RETRY_DELAY_SECONDS <= 0:
+        raise ValueError("RETRY_DELAY_SECONDS must be positive")
+    if TEST_INTERVAL <= 0:
+        raise ValueError("TEST_INTERVAL must be positive")
+    return True
+from atproto import Client
+import os
+import logging
+from dotenv import load_dotenv
+
+class BlueskyAuth:
+   def __init__(self):
+       load_dotenv()
+       self._client = Client()
+       self._isLoggedIn = False
+
+   def login(self) -> bool:
+       """Authenticate with Bluesky using credentials from .env"""
+       try:
+           username = os.getenv('BLUESKY_USERNAME')
+           password = os.getenv('BLUESKY_PASSWORD')
+
+           if not username or not password:
+               logging.error("Missing Bluesky credentials in environment variables")
+               return False
+
+           self._client.login(username, password)
+           self._isLoggedIn = True
+           logging.info("Successfully logged in to Bluesky")
+           return True
+
+       except Exception as e:
+           logging.error(f"Bluesky login error: {str(e)}")
+           return False
+
+   def getClient(self):
+       """Return authenticated client if logged in"""
+       if not self._isLoggedIn:
+           self.login()
+       return self._client
+
+   def isAuthenticated(self) -> bool:
+       """Check if currently authenticated"""
+       return self._isLoggedIn
+from blueskyAuth import BlueskyAuth
+from mySQLauthorisation import MySqlConnector
+from datetime import datetime
+from appSettings import TEST_MODE
+import time
+import logging
+
+class ContentManager:
+   def __init__(self):
+       self.bluesky_auth = BlueskyAuth()
+       self.db_connector = MySqlConnector()
+       # Login once at initialization
+       if not self.bluesky_auth.login():
+           logging.error("Initial Bluesky login failed")
+
+   def get_next_post(self):
+       """Get next pending post from database"""
+       conn = self.db_connector.getConnection()
+       cursor = conn.cursor(dictionary=True)
+
+       try:
+           query = """
+               SELECT * FROM content
+               WHERE status = 'pending'
+               ORDER BY post_number ASC
+               LIMIT 1
+           """
+           cursor.execute(query)
+           return cursor.fetchone()
+       finally:
+           cursor.close()
+
+   def update_post_status(self, post_id: int, status: str, bluesky_id: str = None):
+       """Update post status and related fields in database"""
+       conn = self.db_connector.getConnection()
+       cursor = conn.cursor()
+
+       try:
+           query = """
+               UPDATE content
+               SET status = %s,
+                   post_datetime = %s,
+                   bluesky_post_id = %s
+               WHERE id = %s
+           """
+           cursor.execute(query, (status, datetime.now(), bluesky_id, post_id))
+           conn.commit()
+       except Exception as e:
+           logging.error(f"Failed to update post status: {e}")
+           conn.rollback()
+           raise
+       finally:
+           cursor.close()
+
+   def post_content(self):
+       """Main method to post content to Bluesky"""
+       if not self.bluesky_auth.isAuthenticated():
+           if not self.bluesky_auth.login():
+               logging.error("Failed to login to Bluesky")
+               return False
+
+       # Get the next post
+       post = self.get_next_post()
+       if not post:
+           logging.info("No pending posts found")
+           return False
+
+       if TEST_MODE:
+           logging.info(f"TEST MODE: Would post content: {post['content']}")
+           return True
+
+       client = self.bluesky_auth.getClient()
+
+       try:
+           # Attempt to post to Bluesky
+           response = client.post(text=post['content'])
+
+           # Update database with success
+           self.update_post_status(
+               post_id=post['id'],
+               status='posted',
+               bluesky_id=response['uri']
+           )
+           logging.info(f"Successfully posted content ID {post['id']}")
+           return True
+
+       except Exception as e:
+           # Update database with failure
+           self.update_post_status(
+               post_id=post['id'],
+               status='failed'
+           )
+           logging.error(f"Failed to post content ID {post['id']}: {e}")
+           return False
+
+if __name__ == "__main__":
+   logging.basicConfig(level=logging.INFO)
+   manager = ContentManager()
+   manager.post_content()
+import logging
+from mySQLauthorisation import MySqlConnector
+import os
+import sys
+
+class ContentManager:
+    def __init__(self):
+        self.db_connector = MySqlConnector()
+
+    def check_database(self) -> bool:
+        try:
+            conn = self.db_connector.getConnection()
+            cursor = conn.cursor()
+            cursor.execute("SHOW TABLES LIKE 'content'")
+            exists = cursor.fetchone() is not None
+            cursor.close()
+            return exists
+        except Exception as e:
+            logging.error(f"Database check failed: {e}")
+            return False
+
+    def initialize(self):
+        if not self.check_database():
+            print("Database tables not found. Please set up the database manually.")
+            sys.exit()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    content_manager = ContentManager()
+    content_manager.initialize()
+
+from contentManager import ContentManager
+from databaseChecker import ContentManager as DBManager
+from appSettings import TEST_MODE, POST_INTERVAL_MINUTES, TEST_INTERVAL
+from addContent import ContentAdder
+import time
+import logging
+import sys
+
+def main():
+    # Set up logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    # Initialize database
+    db_manager = DBManager()
+    db_manager.initialize()
+
+    # Add content from markdown files
+    adder = ContentAdder()
+    adder.process_markdown_files('content')
+
+    # Initialize content manager
+    content_manager = ContentManager()
+
+    logger.info("Bluesky Bot Starting...")
+    logger.info(f"Running in {'TEST' if TEST_MODE else 'PRODUCTION'} mode")
+
+    try:
+        while True:
+            # Attempt to post content
+            success = content_manager.post_content()
+            
+            if success:
+                logger.info("Post successful")
+            else:
+                logger.info("No content to post or posting failed")
+
+            # Sleep based on mode
+            interval = TEST_INTERVAL if TEST_MODE else POST_INTERVAL_MINUTES * 60
+            logger.info(f"Waiting {interval} seconds until next post attempt")
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        logger.info("Bot shutting down...")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+import mysql.connector
+from typing import Optional
+import logging
+from dotenv import load_dotenv
+import os
+
+class MySqlConnector:
+   def __init__(self):
+       load_dotenv()
+       self._conn = None
+       self._connect()
+
+   def _connect(self) -> None:
+       """Establish database connection using environment variables"""
+       try:
+           self._conn = mysql.connector.connect(
+               host=os.getenv('DB_HOST'),
+               user=os.getenv('DB_USER'),
+               password=os.getenv('DB_PASSWORD'),
+               database=os.getenv('DB_NAME')
+           )
+       except mysql.connector.Error as err:
+           logging.error(f"Database connection failed: {err}")
+           raise
+
+   def disconnect(self) -> None:
+       """Safely close database connection"""
+       if self._conn and self._conn.is_connected():
+           self._conn.close()
+
+   def getConnection(self):
+       """Return active connection or reconnect if needed"""
+       if not self._conn or not self._conn.is_connected():
+           self._connect()
+       return self._conn
+
+   def __enter__(self):
+       return self
+
+   def __exit__(self, exc_type, exc_val, exc_tb):
+       self.disconnect()
