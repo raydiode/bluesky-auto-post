@@ -1,3 +1,10 @@
+#####
+
+This was a project that was started with the use of Claude.ai as a learning exercise. It became a rabbit hole and inexperience meant it was easier to start again with a new simplified version. It was intended to be modular with future portability in mind compared to the first attempt (Legacy folder). It became overcomplicated and was abandoned.
+MySQL seemed overkill and the third iteration (A new project) was used as an opportunity to experiment with SQLite.
+
+#####
+
 # Bluesky Content Bot
 
 Automated content posting bot for Bluesky social network.
